@@ -1,0 +1,26 @@
+[project]
+name = "grpo-training"
+version = "0.1.0"
+description = "GRPO (DeepSeek style) training implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "datasets>=2.0.0",
+    "tqdm>=4.0.0",
+    "numpy>=1.21.0",
+    "matplotlib>=3.5.0",
+    "accelerate>=0.20.0",
+    "einops",
+    "setuptools",
+    "wheel",
+]
+
+[project.optional-dependencies]
+flash-attn = [
+    "flash-attn>=2.0.0",
+]
+
+[dependency-groups]
+dev = []
