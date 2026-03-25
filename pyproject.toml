@@ -8,6 +8,7 @@ dependencies = [
     "datasets==3.2.0",
     "einops==0.8.0",
     "huggingface-hub==0.28.1",
+    "matplotlib>=3.8.4",
     "numpy==1.21.5",
     "peft==0.14.0",
     "safetensors==0.5.2",
