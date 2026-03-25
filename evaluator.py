@@ -142,6 +142,10 @@ class GSM8kEvaluator(RewardEvaluator):
     
         rewards: List[float] = []
         for pred, gt in zip(extracted, answer):
+            if not pred:               # no tags at all
+                rewards.append(-1.0)  # worse penalty than just wrong answer?
+                continue
+
             gt_str = str(gt).strip()
             pred_str = pred.strip()
     
@@ -149,9 +153,9 @@ class GSM8kEvaluator(RewardEvaluator):
             gt_i = self._parse_int(gt_str)
     
             if pred_i is not None and gt_i is not None:
-                rewards.append(2.0 if pred_i == gt_i else 0.0)
+                rewards.append(2.0 if pred_i == gt_i else -1.0)   #negative penalties for wrong answer
             else:
-                rewards.append(2.0 if pred_str == gt_str else 0.0)
+                rewards.append(2.0 if pred_str == gt_str else -1.0)   #negative penalties for wrong answer
     
         return rewards
     
@@ -188,10 +192,10 @@ class GSM8kEvaluator(RewardEvaluator):
         def score(text: str) -> float:
             text = _normalize_newlines(text)
     
-            r_open = "<reasoning>" in text
-            r_close = "</reasoning>" in text
-            a_open = "<answer>" in text
-            a_close = "</answer>" in text
+            r_open = text.count("<reasoning>") ==1      #check if there is only one <reasoning> tag
+            r_close = text.count("</reasoning>") ==1      #check if there is only one </reasoning> tag
+            a_open = text.count("<answer>") ==1      #check if there is only one <answer> tag   
+            a_close = text.count("</answer>") ==1      #check if there is only one </answer> tag    
     
             # base tag presence rewards
             s = 0.0
