@@ -398,16 +398,6 @@ wheels = [
 ]
 
 [[package]]
-name = "flash-attn"
-version = "2.7.4.post1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "einops" },
-    { name = "torch" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/11/34/9bf60e736ed7bbe15055ac2dab48ec67d9dbd088d2b4ae318fd77190ab4e/flash_attn-2.7.4.post1.tar.gz", hash = "sha256:f03485c9a49a4d68d0733acdcad80ab0e72afa025a777fdc2966ceccf9d51765", size = 5986610, upload-time = "2025-01-30T06:39:51.93Z" }
-
-[[package]]
 name = "frozenlist"
 version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -574,7 +564,6 @@ dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
     { name = "einops" },
-    { name = "flash-attn" },
     { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "peft" },
@@ -592,7 +581,6 @@ requires-dist = [
     { name = "accelerate", specifier = "==1.3.0" },
     { name = "datasets", specifier = "==3.2.0" },
     { name = "einops", specifier = "==0.8.0" },
-    { name = "flash-attn", specifier = "==2.7.4.post1" },
     { name = "huggingface-hub", specifier = "==0.28.1" },
     { name = "numpy", specifier = "==1.21.5" },
     { name = "peft", specifier = "==0.14.0" },
