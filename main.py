@@ -300,9 +300,47 @@ def compute_loss(
         loss: The computed GRPO loss
         metrics: Dictionary containing additional metrics (response length and kl divergence)
     """
-    # TODO: Implement the GRPO loss function
-    # See README.md Task 2 for implementation steps
-    raise NotImplementedError("Implement compute_loss")
+    logits_to_keep = completion_ids.size(1)
+
+
+    per_token_logps = utils.get_per_token_logps(
+        model, prompt_completion_ids, attention_mask, logits_to_keep
+    )
+
+
+    with torch.inference_mode():
+        ref_per_token_logps = utils.get_per_token_logps(
+            base_model, prompt_completion_ids, attention_mask, logits_to_keep
+        )
+
+    delta = ref_per_token_logps - per_token_logps
+    per_token_kl = torch.exp(delta) - delta - 1
+
+    per_token_policy_obj = per_token_logps * advantages.unsqueeze(1)
+
+
+    per_token_loss = -(per_token_policy_obj - args.kl_weight_beta * per_token_kl)
+
+
+    completion_mask_float = completion_mask.float()
+    masked_loss = (
+        (per_token_loss * completion_mask_float).sum(dim=1) / 
+        completion_mask_float.sum(dim=1).clamp(min=1)
+    )
+    loss = masked_loss.mean()
+
+
+    mean_kl = (
+        (per_token_kl * completion_mask_float).sum(dim=1) / 
+        completion_mask_float.sum(dim=1).clamp(min=1)
+    ).mean().item()
+
+    metrics = {
+        "kl": mean_kl,
+        "response_length": completion_mask_float.sum(dim=1).mean().item(),
+    }
+
+    return loss, metrics
 
 def grpo_loss(
         model: PreTrainedModel,
