@@ -58,7 +58,7 @@ if not pred:
     continue
 ```
 
-When no `<answer>` tags are found, `_extract_xml_answer` returns `""`. Without this check, missing tags too get `0.0` — same as a wrong answer with correct format.
+When no `<answer>` tags are found, `_extract_xml_answer` returns `""`. Without this check, missing tags too get `0.0` , same as a wrong answer with correct format.
 
 ### Bug 4 — Duplicate tags not penalised in `_xml_count_reward`
 
@@ -260,7 +260,7 @@ using HuggingFace's `Trainer` API with cross entropy loss computed only on compl
 
 #### GRPO: Accuracy over Training Steps (Qwen2-0.5B)
 
-![GRPO Evaluation Accuracy](images/task_2_2.png)
+![GRPO Evaluation Accuracy](images/task22.png)
 
 ---
 
