@@ -197,6 +197,8 @@ prompt_mask = prompt_mask.to(model_device)
 Both changes are backwards compatible — on a single GPU `device_map="auto"` simply
 places everything on `cuda:0`, identical to the original behaviour.
 
+Even though Qwen-7B was trained on 2 GPUs, memory was still a bottleneck, hence the number of chains (group size in GRPO) is reduced from 16 to 8, which it is kept at 16 for the other two models.
+
 ---
 
 ### Results
@@ -233,3 +235,66 @@ suggesting it could improve further with more steps.
 - For the best of both worlds, 1.5B offers the best accuracy-to-compute ratio
 - The 0.5B model is the most data efficient in terms of cost per training step
   but hits a hard capability ceiling that more training cannot overcome
+
+
+# Task 4: RL vs SFT Efficiency
+
+### Setup
+
+Gold standard solutions for aroun 700 GSM8K training problems were generated using GPT-4o
+via the OpenAI API, prompted with the exact same system prompt used in GRPO training
+to ensure format consistency (`<reasoning>...</reasoning><answer>...</answer>`).
+SFT was then run on Qwen2-0.5B-Instruct across three subset sizes (100, 250, 500 examples)
+using HuggingFace's `Trainer` API with cross entropy loss computed only on completion tokens
+(prompt tokens masked with `-100`).
+
+---
+
+### Results
+
+#### SFT: Accuracy vs Number of Training Examples
+
+![SFT Data Efficiency](images/task4.png)
+
+
+
+#### GRPO: Accuracy over Training Steps (Qwen2-0.5B)
+
+![GRPO Evaluation Accuracy](images/task_2_2.png)
+
+---
+
+### Comparison and Analysis
+
+**Final accuracy is comparable, but SFT gets there with dramatically less signal.**
+Both approaches converge to ~50% on Qwen2-0.5B, but the path to get there reveals
+a striking difference in information efficiency:
+
+
+**SFT is significantly more information efficient.** With just 100 demonstrations SFT
+reaches 42% , a level that GRPO takes ~300-400 steps and 16 chains per step (~5000
+total model calls) to match. 
+
+The reason comes down to the density of the learning signal:
+
+**In SFT**, the loss is computed as cross entropy at every single completion token.
+If a response is 200 tokens long, the model receives **200 independent gradient signals**
+per example , one per token , each directly telling it the exact correct next token to
+generate. The feedback is dense, precise, and immediate at every position in the sequence.
+
+**In GRPO**, a single scalar reward is assigned to the entire completion. This sequence-level
+reward is then broadcast back across all completion tokens as a uniform advantage signal $\hat{A}_i$.
+The gradient signal at each token is therefore heavily diluted, a single
+judgment spread thinly across hundreds of tokens. The model has no way of knowing *which*
+tokens contributed to getting the answer right or wrong, only that the sequence as a whole did.
+
+This is the fundamental credit assignment problem in RL: GRPO must infer from a weak,
+delayed, sequence-level signal what individual token-level decisions were responsible for
+the outcome. SFT sidesteps this entirely by providing exact token-level supervision.
+
+**Why use GRPO at all then?** The key advantage is that GRPO requires no demonstrations.
+Generating 500 GPT-4o solutions costs money and requires a powerful teacher model.
+GRPO only needs questions and a verifiable reward signal ,making it attractive in domains
+where high quality demonstrations are expensive, unavailable, or impossible to generate.
+SFT also risks overfitting to the style of the teacher model (GPT-4o in our case), whereas
+GRPO discovers solutions independently through exploration.
