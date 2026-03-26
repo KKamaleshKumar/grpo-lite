@@ -13,10 +13,6 @@ import llms
 import utils
 import evaluator
 import rl_datasets
-from accelerate import Accelerator
-
-accelerator = Accelerator()
-device = accelerator.device
 
 def eval_on_test_set(
     model: PreTrainedModel,
@@ -159,8 +155,9 @@ def generate_completions(
     prompt_mask = prompt_mask.repeat(args.num_chains, 1)
 
     # Move tensors to device
-    prompt_ids = prompt_ids.to(device)
-    prompt_mask = prompt_mask.to(device)
+    model_device = next(model.parameters()).device
+    prompt_ids = prompt_ids.to(model_device)
+    prompt_mask = prompt_mask.to(model_device)
 
     # Set up generation config
     generation_config = GenerationConfig(
@@ -184,9 +181,9 @@ def generate_completions(
 
     # Do masking 
     is_eos = completion_ids == tokenizer.eos_token_id
-    eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+    eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=model_device)
     eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-    sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+    sequence_indices = torch.arange(is_eos.size(1), device=model_device).expand(is_eos.size(0), -1)
     completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
@@ -500,11 +497,6 @@ if __name__ == "__main__":
         eps=1e-8
     )
 
-
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
-    base_model = accelerator.prepare(base_model)
-
-
     # Add linear warmup learning rate scheduler
     warmup_steps = int(args.warmup_percent * args.num_train_iters / args.gradient_accumulation_steps)
     def get_lr(step):
@@ -609,7 +601,7 @@ if __name__ == "__main__":
         
         # Gradient accumulation
         total_loss = total_loss / args.gradient_accumulation_steps
-        accelerator.backward(total_loss)
+        total_loss.backward()
         accumulated_loss += total_loss.item()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
