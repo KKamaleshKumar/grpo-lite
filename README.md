@@ -79,13 +79,11 @@ a_close = text.count("</answer>") == 1
 
 The standard GRPO paper formulates the policy objective using an importance sampling ratio:
 
-```
-policy_obj_t = [π_θ(a_t|s_t) / π_old(a_t|s_t)] * A_i
-```
+$$\mathcal{L}^{GRPO} = \frac{\pi_{\theta}(a_t \mid s_t)}{\pi_{\theta}^{old}(a_t \mid s_t)} \cdot \hat{A}_i$$
 
-This ratio is necessary when **multiple gradient updates are performed on the same rollouts** (µ > 1),
+This ratio is necessary when **multiple gradient updates are performed on the same rollouts**,
 because after the first update π_θ ≠ π_old and the ratio drifts from 1. In that setting,
-`clamp_epsilon` clips the ratio to `[1-ε, 1+ε]` for stability, which is identical to PPO clipping.
+$\epsilon$ clips the ratio to $[1-\varepsilon, 1+\varepsilon]$ for stability, which is identical to PPO clipping.
 
 **However, inspecting the training loop in `main.py` reveals this codebase is fully on-policy:**
 
@@ -98,35 +96,29 @@ for round_num in range(start_step, args.num_train_iters):
 ```
 
 Fresh completions are generated from the current policy at every iteration and a gradient
-step is taken immediately. There is no inner loop reusing rollouts (effectively µ=1). Therefore:
+step is taken immediately. There is no inner loop reusing rollouts.
 
-```
-π_θ(a_t|s_t) / π_old(a_t|s_t) = 1   always
-```
+Since rollouts are generated fresh each iteration:
+
+$$\frac{\pi_{\theta}(a_t \mid s_t)}{\pi_{\theta}^{old}(a_t \mid s_t)} = 1 \quad \forall t$$
 
 This means:
-
 - The importance sampling ratio is always 1 and adds no information
-- `clamp_epsilon` never activates and is irrelevant
-- The policy gradient simplifies to pure REINFORCE.
+- the clipping objective never activates and is irrelevant — the ratio never leaves $[1-\varepsilon, 1+\varepsilon]$
+- The policy gradient simplifies to pure REINFORCE style.
 
-The implemented loss is:
+The implemented loss is therefore:
 
-```
-L = -1/N * Σ_i [ 1/T_i * Σ_t [ A_i * log π_θ(a_t|s_t) - β * KL_t ] ]
-```
+$$\mathcal{L}(\theta) = -\frac{1}{N}\sum_{i=1}^{N} \frac{1}{T_i}\sum_{t=1}^{T_i} 
+\left[ \hat{A}_i \cdot \log\pi_{\theta}(a_t \mid s_t) - \beta \cdot \widehat{\mathbb{KL}}_t \right]$$
 
 where the KL penalty uses the approximation from DeepSeek-R1:
 
-```
-KL_t = exp(log π_ref - log π_θ) - (log π_ref - log π_θ) - 1
-```
+$$\widehat{\mathbb{KL}}_t = e^{\delta_t} - \delta_t - 1, \quad \delta_t = \log\pi_{ref}(a_t \mid s_t) - \log\pi_{\theta}(a_t \mid s_t)$$
 
-This is always >= 0 and equals 0 when π_θ = π_ref.
+This estimator is always $\geq 0$ and equals $0$ only when $\pi_{\theta} = \pi_{ref}$.
 
-### What Would Change for Multi-Epoch GRPO
-
-To extend this to true multi-epoch GRPO (µ > 1), three changes are needed:
+To extend this to true multi-epoch GRPO , three changes are needed:
 
 1. Save `old_logps` before the inner loop:
 
@@ -154,3 +146,90 @@ per_token_policy_obj = torch.min(ratio * advantages, clipped * advantages)
 
 ### Evaluation Accuracy
 ![Evaluation Accuracy](images/task22.png)
+
+
+
+# Task 3: Scaling Laws Analysis
+
+### Setup Changes for Multi-GPU (Qwen2-7B)
+
+Training Qwen2-7B required two changes from the default single-GPU setup:
+
+**1. `llms.py` — switched to `device_map="auto"`:**
+
+The original code used `device_map=None` with `.to(device)` which loads the entire
+model onto a single GPU. For 7B with model + base_model (~28GB VRAM each), this OOMs
+on a single H100 (80GB). Switching to `device_map="auto"` lets HuggingFace automatically
+spread layers across both GPUs:
+```python
+# before
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+    device_map=None,
+).to(device)
+
+# after
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+    device_map="auto",  # spreads across all available GPUs
+)
+```
+
+**2. `main.py` — device inference from model parameters:**
+
+With `device_map="auto"` the model lives across multiple devices so there is no single
+`device` to move tensors to. Fixed by inferring the device from the model's first parameter:
+```python
+# before
+prompt_ids = prompt_ids.to(device)
+prompt_mask = prompt_mask.to(device)
+
+# after
+model_device = next(model.parameters()).device
+prompt_ids = prompt_ids.to(model_device)
+prompt_mask = prompt_mask.to(model_device)
+```
+
+Both changes are backwards compatible — on a single GPU `device_map="auto"` simply
+places everything on `cuda:0`, identical to the original behaviour.
+
+---
+
+### Results
+
+#### Plot 1: Final Accuracy vs Model Size
+
+![Performance vs Scale](images/task31.png)
+
+All three models show clear improvement after 1000 steps of GRPO training:
+
+
+ going from 0.5B to 1.5B (3x parameters) gives +27% accuracy, while 1.5B to 7B (~5x parameters) gives another +18%. The 7B model surpasses the human performance baseline (~90%) on GSM8K.
+
+#### Plot 2: Accuracy Over Training Steps
+
+![Accuracy Over Training Steps](images/task32.png)
+
+---
+
+### Findings
+
+**Larger models learn faster.** The 7B model starts at 64% accuracy at step 0 (strong
+base model capability) and plateaus quickly around step 200. The 0.5B model starts near 0%
+and takes ~300 steps just to get meaningful signal.
+
+**Larger models plateau higher.** The 0.5B model appears to plateau around 47-50%
+suggesting it has reached the limit of what GRPO can extract at that scale for this
+task. The 1.5B model plateaus around 74-76%. The 7B model keeps a slight upward trend
+suggesting it could improve further with more steps.
+
+
+**Trade-offs observed:**
+- The 7B model requires 2x H100s and takes ~4x longer per iteration than 0.5B
+- For the best of both worlds, 1.5B offers the best accuracy-to-compute ratio
+- The 0.5B model is the most data efficient in terms of cost per training step
+  but hits a hard capability ceiling that more training cannot overcome
