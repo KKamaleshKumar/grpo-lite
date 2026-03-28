@@ -207,35 +207,68 @@ Even though Qwen-7B was trained on 2 GPUs, memory was still a bottleneck, hence 
 
 ![Performance vs Scale](images/task31.png)
 
-All three models show clear improvement after 1000 steps of GRPO training:
-
-
- going from 0.5B to 1.5B (3x parameters) gives +27% accuracy, while 1.5B to 7B (~5x parameters) gives another +18%. The 7B model surpasses the human performance baseline (~90%) on GSM8K.
-
 #### Plot 2: Accuracy Over Training Steps
 
 ![Accuracy Over Training Steps](images/task32.png)
 
 ---
 
-### Findings
+### 1. Log-linear scaling with model size
+Accuracy scales log-linearly with 
+model parameters. Plotting final accuracy against model size on a log scale reveals 
+a near straight line (0.5B → 47%, 1.5B → 74%, 7B → 92%).
 
-**Larger models learn faster.** The 7B model starts at 64% accuracy at step 0 (strong
-base model capability) and plateaus quickly around step 200. The 0.5B model starts near 0%
-and takes ~300 steps just to get meaningful signal.
+### 2. Capacity ceilings are model-size dependent
+All three models follow an S-curve during training — slow initial phase, rapid 
+learning, then plateau. Critically, the plateau level is determined by model size 
+not training duration:
 
-**Larger models plateau higher.** The 0.5B model appears to plateau around 47-50%
-suggesting it has reached the limit of what GRPO can extract at that scale for this
-task. The 1.5B model plateaus around 74-76%. The 7B model keeps a slight upward trend
-suggesting it could improve further with more steps.
+- 0.5B plateaus at ~50% around step 700 — more steps will not help
+- 1.5B plateaus at ~74% and shows signs of continued improvement
+- 7B reaches ~92% and continues a slight upward trend at step 1000
 
+This is a direct prediction of scaling laws — the capacity ceiling can only be 
+raised by increasing model size, not by training longer.
 
-**Trade-offs observed:**
-- The 7B model requires 2x H100s and takes ~4x longer per iteration than 0.5B
-- For the best of both worlds, 1.5B offers the best accuracy-to-compute ratio
-- The 0.5B model is the most data efficient in terms of cost per training step
-  but hits a hard capability ceiling that more training cannot overcome
+### 3. The exploration bottleneck in RL
+A key difference from supervised scaling laws is the **exploration bottleneck** 
+unique to RL training. GRPO only produces a learning signal when the model 
+occasionally generates a correct answer — if it never does, all advantages are 
+zero and no gradient flows:
 
+$$\text{reward\_std} \approx 0 \implies \hat{A}_i \approx 0 \implies \nabla_\theta \mathcal{L} \approx 0$$
+
+This explains why the 0.5B model shows almost no improvement for the first 200 
+steps — it needs to stumble onto correct answers before GRPO can amplify them. 
+The 7B model starts at 64% accuracy and learns immediately because it already 
+generates correct answers frequently enough to get consistent reward signal.
+
+This suggests a **minimum capability threshold** for effective RL training, 
+consistent with findings from DeepSeek-R1 that RL reasoning training is most 
+effective above ~1B parameters.
+
+### 4. Larger models are more RL-efficient
+Larger models benefit disproportionately from RL fine-tuning:
+
+| Model | Baseline (step 0) | Final (step 1000) | Gain |
+|---|---|---|---|
+| 0.5B | ~1% | ~47% | +46% |
+| 1.5B | ~29% | ~74% | +45% |
+| 7B | ~64% | ~92% | +28% |
+
+While absolute gains are similar for 0.5B and 1.5B, the 7B model achieves a much 
+higher final accuracy from a much stronger starting point. In relative terms, 
+smaller models see larger percentage improvements but are fundamentally limited 
+by their capacity ceiling.
+
+### Summary
+The key takeaway across all observations is that **model size is the dominant 
+factor** — it determines the capacity ceiling, the strength of the initial reward 
+signal, and ultimately the peak accuracy achievable. Training duration and RL 
+hyperparameters are secondary levers that help the model approach its ceiling 
+faster but cannot raise it. For tasks requiring strong reasoning, investing in 
+a larger base model yields far greater returns than extended RL training on a 
+smaller one.
 
 # Task 4: RL vs SFT Efficiency
 
