@@ -236,7 +236,7 @@ unique to RL training. GRPO only produces a learning signal when the model
 occasionally generates a correct answer — if it never does, all advantages are 
 zero and no gradient flows:
 
-$$\text{reward\_std} \approx 0 \implies \hat{A}_i \approx 0 \implies \nabla_\theta \mathcal{L} \approx 0$$
+$$\text{reward}_{\text{std}} \approx 0 \implies \hat{A}_i \approx 0 \implies \nabla_\theta \mathcal{L} \approx 0$$
 
 This explains why the 0.5B model shows almost no improvement for the first 200 
 steps — it needs to stumble onto correct answers before GRPO can amplify them. 
