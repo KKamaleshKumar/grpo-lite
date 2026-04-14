@@ -1,19 +1,27 @@
-# Setup
+# GRPO Fine-tuning for Mathematical Reasoning on GSM8K
 
-All experiments were run on Vast.ai GPU instances.
+Implementing GRPO from scratch to fine-tune Qwen2 (0.5B, 1.5B, 7B) on GSM8K,
+with a scaling analysis across model sizes and a data-efficiency comparison against SFT.
 
-- **1× H100 SXM**: GRPO training for Qwen2-0.5B and Qwen2-1.5B, and SFT experiments for Qwen2-0.5B
-- **2× H100 SXM**: GRPO training for Qwen2-7B
+---
 
-GPT-4o (via OpenAI API) was used to generate 700 samples of SFT training data.
+## Overview
 
-# Task 1: Environment Setup & Bug Fixes
+This project applies Group Relative Policy Optimisation (GRPO) to fine-tune Qwen2-Instruct models on GSM8K without any human demonstrations,
+using only a scalar correctness reward. The work covers a from-scratch GRPO loss
+implementation, reward function design, multi-GPU training for Qwen2-7B, and a direct
+comparison of RL versus GPT-4o-distilled SFT across three dataset sizes (100, 250, 500
+examples).
 
-## Part A: uv Setup
+All experiments ran on Vast.ai H100 SXM instances — single GPU for Qwen2-0.5B and 1.5B,
+dual GPU for Qwen2-7B.
 
-### Dependency Migration
+---
 
-Converted `requirements.txt` to `uv` + `pyproject.toml`:
+## Environment Setup
+
+Migrated from a full `pip freeze` system dump to a minimal `uv` + `pyproject.toml`
+dependency specification, keeping only packages directly imported by the codebase.
 
 ```bash
 uv init --no-readme
@@ -23,21 +31,24 @@ uv add -r requirements.txt
 uv sync
 ```
 
-The original `requirements.txt` was a full `pip freeze` dump of a system environment. It was cleaned down to only packages actually imported  or of relevance to the codebase.
-
-### Flash Attention 2
+Flash Attention 2 requires `--no-build-isolation` so the build process can resolve the
+existing PyTorch/CUDA installation. Without it, compilation fails. Compiles from source
+in ~15 minutes.
 
 ```bash
 uv pip install flash-attn --no-build-isolation
 ```
 
-`--no-build-isolation` is required so the build process can see the existing PyTorch/CUDA installation. Without it, compilation fails. Takes ~15 minutes to compile from source.
-
 ---
 
-## Part B: Bug Fixes in `evaluator.py`
+## Reward Function Structure
 
-### Bug 1 — No penalty for wrong answers
+
+
+**Fix 1 — No penalty for incorrect predictions.** Wrong answers received `0.0`, identical
+to missing format tags. GRPO updates are driven by relative reward differences across
+completions in a group — a flat reward surface produces near-zero advantages and kills
+the gradient signal. Fixed with a contrastive reward:
 
 ```python
 # before
@@ -47,24 +58,23 @@ rewards.append(2.0 if pred_i == gt_i else 0.0)
 rewards.append(2.0 if pred_i == gt_i else -1.0)
 ```
 
-Wrong answers got `0.0` , same as missing tags. GRPO learns by comparing rewards relatively hence a contrastive definiton (`2.0` vs `-1.0`) gives a stronger training signal.
-
-### Bug 2 — Missing tags not penalised
+**Fix 2 — Missing `<answer>` tags not penalised.** `_extract_xml_answer` returns `""`
+when no tags are found. Without an explicit guard, the empty string falls through to the
+comparison branch and receives `0.0` — same score as a correctly formatted wrong answer:
 
 ```python
-# add explicit check before comparison
 if not pred:
     rewards.append(-1.0)
     continue
 ```
 
-When no `<answer>` tags are found, `_extract_xml_answer` returns `""`. Without this check, missing tags too get `0.0` , same as a wrong answer with correct format.
-
-### Bug 4 — Duplicate tags not penalised in `_xml_count_reward`
+**Fix 3 — Duplicate XML tags not caught in `_xml_count_reward`.** The `in` operator
+returns `True` regardless of tag count, so responses with repeated tags were rewarded
+as correctly formatted. Replaced with exact-count checks:
 
 ```python
 # before
-r_open = "<reasoning>" in text   # True even if tag appears multiple times
+r_open = "<reasoning>" in text
 
 # after
 r_open  = text.count("<reasoning>") == 1
@@ -73,61 +83,61 @@ a_open  = text.count("<answer>") == 1
 a_close = text.count("</answer>") == 1
 ```
 
-# Task 2
+---
 
-## Part A: GRPO Loss Implementation
+## GRPO Loss Implementation
 
-The standard GRPO paper formulates the policy objective using an importance sampling ratio:
+### On-policy simplification
+
+The standard GRPO objective applies an importance sampling ratio
+$\pi_\theta / \pi_\theta^{old}$ with PPO-style clipping:
 
 $$\mathcal{L}^{GRPO} = \frac{\pi_{\theta}(a_t \mid s_t)}{\pi_{\theta}^{old}(a_t \mid s_t)} \cdot \hat{A}_i$$
 
-This ratio is necessary when **multiple gradient updates are performed on the same rollouts**,
-because after the first update π_θ ≠ π_old and the ratio drifts from 1. In that setting,
-$\epsilon$ clips the ratio to $[1-\varepsilon, 1+\varepsilon]$ for stability, which is identical to PPO clipping.
+This is necessary when rollouts are reused across multiple gradient updates — after
+the first update $\pi_\theta \neq \pi_\theta^{old}$ and the ratio drifts away from 1.
+The $\varepsilon$-clipping then stabilises training by constraining the ratio to
+$[1-\varepsilon, 1+\varepsilon]$.
 
-**However, inspecting the training loop in `main.py` reveals this codebase is fully on-policy:**
+The training loop in `main.py` is fully on-policy, fresh completions are sampled from
+the current policy at every iteration with an immediate gradient step:
 
 ```python
 for round_num in range(start_step, args.num_train_iters):
     question, answer = next(train_loader)
-    total_loss = grpo_loss(...)  # generates NEW completions from current policy
+    total_loss = grpo_loss(...)  # samples from current π_θ
     total_loss.backward()
-    optimizer.step()            # weights update immediately
+    optimizer.step()
 ```
 
-Fresh completions are generated from the current policy at every iteration and a gradient
-step is taken immediately. There is no inner loop reusing rollouts.
-
-Since rollouts are generated fresh each iteration:
+Since $\pi_\theta^{old} = \pi_\theta$ at the point of sampling:
 
 $$\frac{\pi_{\theta}(a_t \mid s_t)}{\pi_{\theta}^{old}(a_t \mid s_t)} = 1 \quad \forall t$$
 
-This means:
-- The importance sampling ratio is always 1 and adds no information
-- the clipping objective never activates and is irrelevant — the ratio never leaves $[1-\varepsilon, 1+\varepsilon]$
-- The policy gradient simplifies to pure REINFORCE style.
+The ratio is always 1, clipping never activates, and the objective reduces to REINFORCE
+with a KL penalty. The implemented loss is therefore:
 
-The implemented loss is therefore:
-
-$$\mathcal{L}(\theta) = -\frac{1}{N}\sum_{i=1}^{N} \frac{1}{T_i}\sum_{t=1}^{T_i} 
+$$\mathcal{L}(\theta) = -\frac{1}{N}\sum_{i=1}^{N} \frac{1}{T_i}\sum_{t=1}^{T_i}
 \left[ \hat{A}_i \cdot \log\pi_{\theta}(a_t \mid s_t) - \beta \cdot \widehat{\mathbb{KL}}_t \right]$$
 
-where the KL penalty uses the approximation from DeepSeek-R1:
+The KL term uses the DeepSeek-R1 estimator:
 
 $$\widehat{\mathbb{KL}}_t = e^{\delta_t} - \delta_t - 1, \quad \delta_t = \log\pi_{ref}(a_t \mid s_t) - \log\pi_{\theta}(a_t \mid s_t)$$
 
-This estimator is always $\geq 0$ and equals $0$ only when $\pi_{\theta} = \pi_{ref}$.
+This estimator is always $\geq 0$ and equals $0$ only when $\pi_\theta = \pi_{ref}$.
 
-To extend this to true multi-epoch GRPO , three changes are needed:
+### Extending to multi-epoch GRPO
 
-1. Save `old_logps` before the inner loop:
+To reuse rollouts across $\mu$ gradient steps (true GRPO), three changes are needed:
+
+**1.** Compute and detach `old_logps` before the inner loop:
 
 ```python
 with torch.inference_mode():
     old_logps = get_per_token_logps(model, ...).detach()
 ```
 
-1. Replace the policy objective with the clipped ratio:
+**2.** Replace the policy objective with the clipped IS ratio:
 
 ```python
 ratio = torch.exp(per_token_logps - old_logps)
@@ -135,32 +145,27 @@ clipped = torch.clamp(ratio, 1 - args.clamp_epsilon, 1 + args.clamp_epsilon)
 per_token_policy_obj = torch.min(ratio * advantages, clipped * advantages)
 ```
 
-1. Add an inner loop reusing the same rollouts for µ steps before generating new ones.
+**3.** Add an inner loop that reuses each set of rollouts for $\mu$ steps before
+sampling new completions.
 
-
-## Part B: Training & Results:
-
-### Total Reward During Training
+### Training & Results
 
 ![Total Reward During Training](images/task21.png)
-
-### Evaluation Accuracy
 ![Evaluation Accuracy](images/task22.png)
 
+---
 
+## Scaling Analysis (Qwen2-0.5B / 1.5B / 7B)
 
-# Task 3: Scaling Laws Analysis
+### Multi-GPU setup for Qwen2-7B
 
-### Setup Changes for Multi-GPU (Qwen2-7B)
+Running Qwen2-7B with a frozen reference copy requires ~56GB VRAM (2× bfloat16 copies
+of a 14GB model), which exceeds a single H100's 80GB when combined with activations and
+optimiser state. Two changes were needed:
 
-Training Qwen2-7B required two changes from the default single-GPU setup:
+**`llms.py` — switched to `device_map="auto"`** to let HuggingFace distribute layers
+across both GPUs automatically:
 
-**1. `llms.py` — switched to `device_map="auto"`:**
-
-The original code used `device_map=None` with `.to(device)` which loads the entire
-model onto a single GPU. For 7B with model + base_model (~28GB VRAM each), this OOMs
-on a single H100 (80GB). Switching to `device_map="auto"` lets HuggingFace automatically
-spread layers across both GPUs:
 ```python
 # before
 model = AutoModelForCausalLM.from_pretrained(
@@ -175,159 +180,112 @@ model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
-    device_map="auto",  # spreads across all available GPUs
+    device_map="auto",
 )
 ```
 
-**2. `main.py` — device inference from model parameters:**
+**`main.py` — device inference from model parameters:** With `device_map="auto"` there
+is no single `.device` attribute to move tensors to. Fixed by inferring from the first
+parameter:
 
-With `device_map="auto"` the model lives across multiple devices so there is no single
-`device` to move tensors to. Fixed by inferring the device from the model's first parameter:
 ```python
 # before
 prompt_ids = prompt_ids.to(device)
-prompt_mask = prompt_mask.to(device)
 
 # after
 model_device = next(model.parameters()).device
 prompt_ids = prompt_ids.to(model_device)
-prompt_mask = prompt_mask.to(model_device)
 ```
 
-Both changes are backwards compatible — on a single GPU `device_map="auto"` simply
-places everything on `cuda:0`, identical to the original behaviour.
-
-Even though Qwen-7B was trained on 2 GPUs, memory was still a bottleneck, hence the number of chains (group size in GRPO) is reduced from 16 to 8, which it is kept at 16 for the other two models.
-
----
+Both changes are backwards-compatible — on a single GPU `device_map="auto"` places
+everything on `cuda:0`, identical to the original behaviour. VRAM pressure also required
+reducing the GRPO group size from 16 to 8 chains for Qwen2-7B.
 
 ### Results
 
-#### Plot 1: Final Accuracy vs Model Size
-
-![Performance vs Scale](images/task31.png)
-
-#### Plot 2: Accuracy Over Training Steps
-
+![Final Accuracy vs Model Size](images/task31.png)
 ![Accuracy Over Training Steps](images/task32.png)
+
+### Observations
+
+**Log-linear scaling with parameter count.** Final accuracy scales log-linearly with
+model size: Qwen2-0.5B → 47%, Qwen2-1.5B → 74%, Qwen2-7B → 92%. Plotting against
+log-scale parameter count yields a near-straight line, consistent with standard neural
+scaling law predictions.
+
+**Capacity ceilings are model-size dependent, not training-duration dependent.** All
+three models follow an S-curve — slow initial phase, rapid improvement, plateau. The
+plateau level is set by parameter count:
+
+- Qwen2-0.5B saturates at ~50% by step 700; additional steps produce no improvement
+- Qwen2-1.5B plateaus at ~74% with signs of marginal continued improvement
+- Qwen2-7B reaches ~92% with a slight upward trend at step 1000
+
+**The exploration bottleneck.** GRPO only generates a learning signal when the policy
+occasionally produces a correct completion — if reward variance within a group is zero,
+all normalised advantages are zero and no gradient flows:
+
+$$\text{reward\_std} \approx 0 \implies \hat{A}_i \approx 0 \implies \nabla_\theta \mathcal{L} \approx 0$$
+
+This explains Qwen2-0.5B's flat first ~200 steps: the model needs to stumble onto
+correct completions before GRPO can amplify them. Qwen2-7B starts at 64% zero-shot
+accuracy and benefits from a consistent reward signal immediately, matching DeepSeek-R1's
+finding that GRPO is most effective above ~1B parameters.
+
+**Absolute vs relative gains across scales:**
+
+| Model | Step 0 | Step 1000 | Absolute Gain |
+|-------|--------|-----------|---------------|
+| Qwen2-0.5B | ~1% | ~47% | +46% |
+| Qwen2-1.5B | ~29% | ~74% | +45% |
+| Qwen2-7B | ~64% | ~92% | +28% |
+
+Absolute gains are similar for 0.5B and 1.5B, but Qwen2-7B achieves a substantially
+higher ceiling from a much stronger initialisation. Model size is the dominant factor —
+it determines the zero-shot baseline, the capacity ceiling, and the strength of the
+reward signal throughout training. Extended RL training on a capacity-limited model
+does not substitute for scale.
 
 ---
 
-### 1. Log-linear scaling with model size
-Accuracy scales log-linearly with 
-model parameters. Plotting final accuracy against model size on a log scale reveals 
-a near straight line (0.5B → 47%, 1.5B → 74%, 7B → 92%).
-
-### 2. Capacity ceilings are model-size dependent
-All three models follow an S-curve during training — slow initial phase, rapid 
-learning, then plateau. Critically, the plateau level is determined by model size 
-not training duration:
-
-- 0.5B plateaus at ~50% around step 700 — more steps will not help
-- 1.5B plateaus at ~74% and shows signs of continued improvement
-- 7B reaches ~92% and continues a slight upward trend at step 1000
-
-This is a direct prediction of scaling laws — the capacity ceiling can only be 
-raised by increasing model size, not by training longer.
-
-### 3. The exploration bottleneck in RL
-A key difference from supervised scaling laws is the **exploration bottleneck** 
-unique to RL training. GRPO only produces a learning signal when the model 
-occasionally generates a correct answer — if it never does, all advantages are 
-zero and no gradient flows:
-
-$$\text{reward}_{\text{std}} \approx 0 \implies \hat{A}_i \approx 0 \implies \nabla_\theta \mathcal{L} \approx 0$$
-
-This explains why the 0.5B model shows almost no improvement for the first 200 
-steps — it needs to stumble onto correct answers before GRPO can amplify them. 
-The 7B model starts at 64% accuracy and learns immediately because it already 
-generates correct answers frequently enough to get consistent reward signal.
-
-This suggests a **minimum capability threshold** for effective RL training, 
-consistent with findings from DeepSeek-R1 that RL reasoning training is most 
-effective above ~1B parameters.
-
-### 4. Larger models are more RL-efficient
-Larger models benefit disproportionately from RL fine-tuning:
-
-| Model | Baseline (step 0) | Final (step 1000) | Gain |
-|---|---|---|---|
-| 0.5B | ~1% | ~47% | +46% |
-| 1.5B | ~29% | ~74% | +45% |
-| 7B | ~64% | ~92% | +28% |
-
-While absolute gains are similar for 0.5B and 1.5B, the 7B model achieves a much 
-higher final accuracy from a much stronger starting point. In relative terms, 
-smaller models see larger percentage improvements but are fundamentally limited 
-by their capacity ceiling.
-
-### Summary
-The key takeaway across all observations is that **model size is the dominant 
-factor** — it determines the capacity ceiling, the strength of the initial reward 
-signal, and ultimately the peak accuracy achievable. Training duration and RL 
-hyperparameters are secondary levers that help the model approach its ceiling 
-faster but cannot raise it. For tasks requiring strong reasoning, investing in 
-a larger base model yields far greater returns than extended RL training on a 
-smaller one.
-
-# Task 4: RL vs SFT Efficiency
+## RL vs SFT Data Efficiency
 
 ### Setup
 
-Gold standard solutions for aroun 700 GSM8K training problems were generated using GPT-4o
-via the OpenAI API, prompted with the exact same system prompt used in GRPO training
-to ensure format consistency (`<reasoning>...</reasoning><answer>...</answer>`).
-SFT was then run on Qwen2-0.5B-Instruct across three subset sizes (100, 250, 500 examples)
-using HuggingFace's `Trainer` API with cross entropy loss computed only on completion tokens
-(prompt tokens masked with `-100`).
-
----
+700 GSM8K solutions were generated via GPT-4o (OpenAI API), prompted with the same
+system prompt used during GRPO training to ensure format consistency
+(`<reasoning>...</reasoning><answer>...</answer>`). SFT was then run on Qwen2-0.5B-Instruct
+using HuggingFace `Trainer` with cross-entropy loss computed exclusively on completion
+tokens (prompt tokens masked with `-100`), across three dataset sizes: 100, 250, and
+500 examples.
 
 ### Results
 
-#### SFT: Accuracy vs Number of Training Examples
+![SFT Accuracy vs Dataset Size](images/task4.png)
+![GRPO Accuracy — Qwen2-0.5B](images/task22.png)
 
-![SFT Data Efficiency](images/task4.png)
+### Analysis
 
+Both approaches plateau at ~50% on Qwen2-0.5B, but their paths there expose a large
+difference in gradient signal density.
 
+**SFT computes a cross-entropy loss at every completion token.** A 200-token response
+yields 200 independent gradient updates per example — each directly supervising the
+exact next-token distribution. 100 GPT-4o demonstrations are enough for SFT to reach
+42% accuracy, a level that GRPO requires ~300–400 steps × 16 chains (~5,000 forward
+passes) to match.
 
-#### GRPO: Accuracy over Training Steps (Qwen2-0.5B)
+**GRPO assigns a single scalar reward to the entire completion.** That reward is
+broadcast uniformly across all tokens in the sequence as a constant advantage $\hat{A}_i$.
+The per-token gradient signal is therefore heavily diluted — the model receives no
+information about which token-level decisions drove the outcome. This is the credit
+assignment problem: GRPO must infer token-level responsibility from a sequence-level
+scalar, whereas SFT has exact token-level supervision at every position.
 
-![GRPO Evaluation Accuracy](images/task22.png)
-
----
-
-### Comparison and Analysis
-
-**Final accuracy is comparable, but SFT gets there with dramatically less signal.**
-Both approaches converge to ~50% on Qwen2-0.5B, but the path to get there reveals
-a striking difference in information efficiency:
-
-
-**SFT is significantly more information efficient.** With just 100 demonstrations SFT
-reaches 42% , a level that GRPO takes ~300-400 steps and 16 chains per step (~5000
-total model calls) to match. 
-
-The reason comes down to the density of the learning signal:
-
-**In SFT**, the loss is computed as cross entropy at every single completion token.
-If a response is 200 tokens long, the model receives **200 independent gradient signals**
-per example , one per token , each directly telling it the exact correct next token to
-generate. The feedback is dense, precise, and immediate at every position in the sequence.
-
-**In GRPO**, a single scalar reward is assigned to the entire completion. This sequence-level
-reward is then broadcast back across all completion tokens as a uniform advantage signal $\hat{A}_i$.
-The gradient signal at each token is therefore heavily diluted, a single
-judgment spread thinly across hundreds of tokens. The model has no way of knowing *which*
-tokens contributed to getting the answer right or wrong, only that the sequence as a whole did.
-
-This is the fundamental credit assignment problem in RL: GRPO must infer from a weak,
-delayed, sequence-level signal what individual token-level decisions were responsible for
-the outcome. SFT sidesteps this entirely by providing exact token-level supervision.
-
-**Why use GRPO at all then?** The key advantage is that GRPO requires no demonstrations.
-Generating 500 GPT-4o solutions costs money and requires a powerful teacher model.
-GRPO only needs questions and a verifiable reward signal ,making it attractive in domains
-where high quality demonstrations are expensive, unavailable, or impossible to generate.
-SFT also risks overfitting to the style of the teacher model (GPT-4o in our case), whereas
-GRPO discovers solutions independently through exploration.
+**Why use GRPO at all?** Generating 500 GPT-4o solutions has a direct API cost and
+requires a capable teacher model whose output distribution the student will partially
+inherit (style overfitting). GRPO requires only questions and a verifiable reward
+function — no teacher model, no demonstrations. In domains where ground-truth solutions
+are expensive or impossible to generate (e.g. code execution, formal proofs, novel
+reasoning tasks), GRPO's sample inefficiency is an acceptable trade-off for not
+requiring a supervision source at all.
