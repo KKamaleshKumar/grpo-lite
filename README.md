@@ -225,7 +225,7 @@ plateau level is set by parameter count:
 occasionally produces a correct completion — if reward variance within a group is zero,
 all normalised advantages are zero and no gradient flows:
 
-$$\text{reward\_std} \approx 0 \implies \hat{A}_i \approx 0 \implies \nabla_\theta \mathcal{L} \approx 0$$
+$$\text{reward}_{\text{std}} \approx 0 \implies \hat{A}_i \approx 0 \implies \nabla_\theta \mathcal{L} \approx 0$$
 
 This explains Qwen2-0.5B's flat first ~200 steps: the model needs to stumble onto
 correct completions before GRPO can amplify them. Qwen2-7B starts at 64% zero-shot
